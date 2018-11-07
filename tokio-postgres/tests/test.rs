@@ -17,7 +17,7 @@ use tokio::runtime::current_thread::Runtime;
 use tokio::timer::Delay;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::{Kind, Type};
-use tokio_postgres::{AsyncMessage, TlsMode};
+use tokio_postgres::{AsyncMessage, Client, TlsMode};
 
 fn smoke_test(url: &str) {
     let _ = env_logger::try_init();
@@ -539,6 +539,59 @@ fn transaction_commit() {
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, &str>(0), "steven");
+}
+
+#[test]
+fn transaction_2_commit() {
+    use futures::future::Either;
+
+    let _ = env_logger::try_init();
+    let mut runtime = Runtime::new().unwrap();
+
+    let (mut client, connection) = runtime
+        .block_on(tokio_postgres::connect(
+            "postgres://postgres@localhost:5433".parse().unwrap(),
+            TlsMode::None,
+        )).unwrap();
+    let connection = connection.map_err(|e| panic!("{}", e));
+    runtime.handle().spawn(connection).unwrap();
+
+    runtime
+        .block_on(client.batch_execute(
+            "CREATE TEMPORARY TABLE foo (
+                id SERIAL,
+                name TEXT
+            )",
+        )).unwrap();
+
+    let (mut client, _) = runtime
+        .block_on(Client::transaction2(client, |mut client| {
+            client
+                .batch_execute("INSERT INTO foo (name) VALUES ('steven')")
+                .then(move |res| match res {
+                    Ok(_) => Either::A(
+                        client
+                            .batch_execute("INSERT INTO foo (name) VALUES ('jon')")
+                            .then(move |res| match res {
+                                Ok(_) => Ok((client, ())),
+                                Err(err) => Err((client, err)),
+                            }),
+                    ),
+                    Err(err) => Either::B(future::err((client, err))),
+                })
+        })).map_err(|err| err.1)
+        .unwrap();
+
+    let rows = runtime
+        .block_on(
+            client
+                .prepare("SELECT name FROM foo")
+                .and_then(|s| client.query(&s, &[]).collect()),
+        ).unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, &str>(0), "steven");
+    assert_eq!(rows[1].get::<_, &str>(0), "jon");
 }
 
 #[test]

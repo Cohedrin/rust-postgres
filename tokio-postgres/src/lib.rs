@@ -119,8 +119,33 @@ impl Client {
         Transaction(proto::TransactionFuture::new(self.0.clone(), future))
     }
 
+    pub fn transaction2<FC, F, C, T, E>(
+        mut client: C,
+        future_closure: FC,
+    ) -> Transaction2<FC, F, C, T, E>
+    where
+        C: DerefMut2<Target = Client>,
+        F: Future<Item = (C, T), Error = (C, E)>,
+        FC: Fn(C) -> F,
+        E: From<Error>,
+    {
+        Transaction2(proto::Transaction2Future::new(client, future_closure))
+    }
+
     pub fn batch_execute(&mut self, query: &str) -> BatchExecute {
         BatchExecute(self.0.batch_execute(query))
+    }
+}
+pub trait DerefMut2 {
+    type Target;
+    fn deref_mut2(&mut self) -> &mut Self::Target;
+}
+
+impl DerefMut2 for Client {
+    type Target = Client;
+
+    fn deref_mut2(&mut self) -> &mut Self::Target {
+        self
     }
 }
 
@@ -348,6 +373,29 @@ where
     type Error = T::Error;
 
     fn poll(&mut self) -> Poll<T::Item, T::Error> {
+        self.0.poll()
+    }
+}
+
+#[must_use = "futures do nothing unless polled"]
+pub struct Transaction2<FC, F, C, T, E>(proto::Transaction2Future<FC, F, C, T, E>)
+where
+    C: DerefMut2<Target = Client>,
+    F: Future<Item = (C, T), Error = (C, E)>,
+    FC: Fn(C) -> F,
+    E: From<Error>;
+
+impl<FC, F, C, T, E> Future for Transaction2<FC, F, C, T, E>
+where
+    C: DerefMut2<Target = Client>,
+    F: Future<Item = (C, T), Error = (C, E)>,
+    FC: Fn(C) -> F,
+    E: From<Error>,
+{
+    type Item = (C, T);
+    type Error = (C, E);
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         self.0.poll()
     }
 }
