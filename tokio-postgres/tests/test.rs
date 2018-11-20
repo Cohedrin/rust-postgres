@@ -564,23 +564,22 @@ fn transaction_2_commit() {
             )",
         )).unwrap();
 
-    let (mut client, _) = runtime
-        .block_on(Client::transaction2(client, |mut client| {
-            client
+    runtime
+        .block_on(Client::transaction2(&mut client, |mut internal_client| {
+            internal_client
                 .batch_execute("INSERT INTO foo (name) VALUES ('steven')")
                 .then(move |res| match res {
                     Ok(_) => Either::A(
-                        client
+                        internal_client
                             .batch_execute("INSERT INTO foo (name) VALUES ('jon')")
                             .then(move |res| match res {
-                                Ok(_) => Ok((client, ())),
-                                Err(err) => Err((client, err)),
+                                Ok(_) => Ok(()),
+                                Err(err) => Err(err),
                             }),
                     ),
-                    Err(err) => Either::B(future::err((client, err))),
+                    Err(err) => Either::B(future::err(err)),
                 })
-        })).map_err(|err| err.1)
-        .unwrap();
+        })).unwrap();
 
     let rows = runtime
         .block_on(
@@ -592,6 +591,61 @@ fn transaction_2_commit() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].get::<_, &str>(0), "steven");
     assert_eq!(rows[1].get::<_, &str>(0), "jon");
+}
+
+#[test]
+#[should_panic(
+    expected = "a reference to the postgres connection was left dangling after transaction completion"
+)]
+fn transaction_2_panic_leak() {
+    use futures::future::Either;
+    use std::sync::{Arc, Mutex};
+
+    let _ = env_logger::try_init();
+    let mut runtime = Runtime::new().unwrap();
+
+    let (mut client, connection) = runtime
+        .block_on(tokio_postgres::connect(
+            "postgres://postgres@localhost:5433".parse().unwrap(),
+            TlsMode::None,
+        )).unwrap();
+    let connection = connection.map_err(|e| panic!("{}", e));
+    runtime.handle().spawn(connection).unwrap();
+
+    runtime
+        .block_on(client.batch_execute(
+            "CREATE TEMPORARY TABLE foo (
+                id SERIAL,
+                name TEXT
+            )",
+        )).unwrap();
+
+    let cell = Arc::new(Mutex::new(None));
+    let cell_2 = cell.clone();
+
+    runtime
+        .block_on(Client::transaction2(
+            &mut client,
+            move |mut internal_client| {
+                let cell_2_inner = cell_2.clone();
+                internal_client
+                    .batch_execute("INSERT INTO foo (name) VALUES ('steven')")
+                    .then(move |res| match res {
+                        Ok(_) => Either::A(
+                            internal_client
+                                .batch_execute("INSERT INTO foo (name) VALUES ('jon')")
+                                .then(move |res| match res {
+                                    Ok(_) => {
+                                        *cell_2_inner.lock().unwrap() = Some(internal_client);
+                                        Ok(())
+                                    }
+                                    Err(err) => Err(err),
+                                }),
+                        ),
+                        Err(err) => Either::B(future::err(err)),
+                    })
+            },
+        )).unwrap();
 }
 
 #[test]

@@ -58,4 +58,4 @@ pub use proto::simple_query::SimpleQueryFuture;
 pub use proto::socket::Socket;
 pub use proto::statement::Statement;
 pub use proto::transaction::TransactionFuture;
-pub use proto::transaction_2::Transaction2Future;
+pub use proto::transaction_2::{CountedClient, Transaction2Future};

@@ -1,51 +1,86 @@
 use futures::{Async, Future, Poll};
 use proto::simple_query::SimpleQueryFuture;
+use raii_counter::{Counter, WeakCounter};
 use state_machine_future::RentToOwn;
+use std::ops::{Deref, DerefMut};
 use Client;
 
 use DerefMut2;
 use Error;
 
+pub struct CountedClient {
+    client: Client,
+    _counter: Counter,
+}
+
+impl CountedClient {
+    pub fn new(client: Client) -> (WeakCounter, Self) {
+        let weak = WeakCounter::new();
+        let client = Self {
+            client,
+            _counter: weak.spawn_upgrade(),
+        };
+
+        (weak, client)
+    }
+}
+
+impl Deref for CountedClient {
+    type Target = Client;
+
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
+impl DerefMut for CountedClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.client
+    }
+}
+
 #[derive(StateMachineFuture)]
-pub enum Transaction2<FC, F, C, T, E>
+pub enum Transaction2<FC, F, T, E>
 where
-    C: DerefMut2<Target = Client>,
-    F: Future<Item = (C, T), Error = (C, E)>,
-    FC: Fn(C) -> F,
+    F: Future<Item = T, Error = E>,
+    FC: Fn(CountedClient) -> F,
     E: From<Error>,
 {
     #[state_machine_future(start, transitions(Beginning))]
-    Start { client: C, future_closure: FC },
+    Start { client: Client, future_closure: FC },
     #[state_machine_future(transitions(Running))]
     Beginning {
-        client: C,
+        client: Client,
         begin: SimpleQueryFuture,
         future_closure: FC,
     },
     #[state_machine_future(transitions(Finishing))]
-    Running { future: F },
+    Running {
+        client: Client,
+        future: F,
+        counter: WeakCounter,
+    },
     #[state_machine_future(transitions(Finished))]
     Finishing {
-        client: C,
         future: SimpleQueryFuture,
         result: Result<T, E>,
+        counter: WeakCounter,
     },
     #[state_machine_future(ready)]
-    Finished((C, T)),
+    Finished(T),
     #[state_machine_future(error)]
-    Failed((C, E)),
+    Failed(E),
 }
 
-impl<FC, F, C, T, E> PollTransaction2<FC, F, C, T, E> for Transaction2<FC, F, C, T, E>
+impl<FC, F, T, E> PollTransaction2<FC, F, T, E> for Transaction2<FC, F, T, E>
 where
-    C: DerefMut2<Target = Client>,
-    F: Future<Item = (C, T), Error = (C, E)>,
-    FC: Fn(C) -> F,
+    F: Future<Item = T, Error = E>,
+    FC: Fn(CountedClient) -> F,
     E: From<Error>,
 {
     fn poll_start<'a>(
-        state: &'a mut RentToOwn<'a, Start<FC, F, C, T, E>>,
-    ) -> Poll<AfterStart<FC, F, C, T, E>, (C, E)> {
+        state: &'a mut RentToOwn<'a, Start<FC, F, T, E>>,
+    ) -> Poll<AfterStart<FC, F, T, E>, E> {
         let mut state = state.take();
         transition!(Beginning {
             begin: state.client.deref_mut2().0.batch_execute("BEGIN"),
@@ -55,70 +90,82 @@ where
     }
 
     fn poll_beginning<'a>(
-        state: &'a mut RentToOwn<'a, Beginning<FC, F, C, T, E>>,
-    ) -> Poll<AfterBeginning<F, C, T, E>, (C, E)> {
-        match state.begin.poll() {
-            Ok(Async::Ready(_)) => (),
-            Ok(Async::NotReady) => return Ok(Async::NotReady),
-            Err(err) => return Err((state.take().client, err.into())),
-        }
+        state: &'a mut RentToOwn<'a, Beginning<FC, F, T, E>>,
+    ) -> Poll<AfterBeginning<F, T, E>, E> {
+        try_ready!(state.begin.poll());
         let state = state.take();
+        let (counter, counted_client) = CountedClient::new(Client(state.client.0.clone()));
         transition!(Running {
-            future: (state.future_closure)(state.client),
+            future: (state.future_closure)(counted_client),
+            client: state.client,
+            counter,
         })
     }
 
     fn poll_running<'a>(
-        state: &'a mut RentToOwn<'a, Running<F, C, T, E>>,
-    ) -> Poll<AfterRunning<C, T, E>, (C, E)> {
-        match state.future.poll() {
+        state: &'a mut RentToOwn<'a, Running<F, T, E>>,
+    ) -> Poll<AfterRunning<T, E>, E> {
+        let result = match state.future.poll() {
             Ok(Async::NotReady) => return Ok(Async::NotReady),
-            Ok(Async::Ready((mut client, t))) => transition!(Finishing {
-                future: client.deref_mut2().0.batch_execute("COMMIT"),
+            Ok(Async::Ready(t)) => Ok(t),
+            Err(err) => Err(err),
+        };
+
+        let mut state = state.take();
+        match result {
+            Ok(t) => transition!(Finishing {
+                future: state.client.0.batch_execute("COMMIT"),
                 result: Ok(t),
-                client,
+                counter: state.counter
             }),
-            Err((mut client, e)) => transition!(Finishing {
-                future: client.deref_mut2().0.batch_execute("ROLLBACK"),
-                result: Err(e),
-                client,
+            Err(err) => transition!(Finishing {
+                future: state.client.deref_mut2().0.batch_execute("ROLLBACK"),
+                result: Err(err),
+                counter: state.counter,
             }),
         }
     }
 
     fn poll_finishing<'a>(
-        state: &'a mut RentToOwn<'a, Finishing<C, T, E>>,
-    ) -> Poll<AfterFinishing<C, T>, (C, E)> {
+        state: &'a mut RentToOwn<'a, Finishing<T, E>>,
+    ) -> Poll<AfterFinishing<T>, E> {
         match state.future.poll() {
             Ok(Async::NotReady) => return Ok(Async::NotReady),
             Ok(Async::Ready(())) => {
                 let state = state.take();
+                assert!(
+                    state.counter.count() == 0,
+                    "a reference to the postgres connection was left dangling after transaction completion"
+                );
 
                 match state.result {
-                    Ok(res) => transition!(Finished((state.client, res))),
-                    Err(err) => Err((state.client, err.into())),
+                    Ok(res) => transition!(Finished(res)),
+                    Err(err) => Err(err.into()),
                 }
             }
             Err(e) => {
                 let state = state.take();
+                assert!(
+                    state.counter.count() == 0,
+                    "a reference to the postgres connection was left dangling after transaction completion"
+                );
                 match state.result {
-                    Ok(_) => Err((state.client, e.into())),
+                    Ok(_) => Err(e.into()),
                     // prioritize the future's error over the rollback error
-                    Err(e) => Err((state.client, e)),
+                    Err(e) => Err(e),
                 }
             }
         }
     }
 }
 
-impl<FC, F, C, T, E> Transaction2Future<FC, F, C, T, E>
+impl<FC, F, T, E> Transaction2Future<FC, F, T, E>
 where
-    C: DerefMut2<Target = Client>,
-    F: Future<Item = (C, T), Error = (C, E)>,
-    FC: Fn(C) -> F,
+    F: Future<Item = T, Error = E>,
+    FC: Fn(CountedClient) -> F,
     E: From<Error>,
 {
-    pub fn new(client: C, future_closure: FC) -> Transaction2Future<FC, F, C, T, E> {
+    pub fn new(client: Client, future_closure: FC) -> Transaction2Future<FC, F, T, E> {
         Transaction2::start(client, future_closure)
     }
 }

@@ -5,6 +5,7 @@ extern crate futures_cpupool;
 extern crate phf;
 extern crate postgres_protocol;
 extern crate postgres_shared;
+extern crate raii_counter;
 extern crate tokio_codec;
 extern crate tokio_io;
 extern crate tokio_tcp;
@@ -120,16 +121,19 @@ impl Client {
     }
 
     pub fn transaction2<FC, F, C, T, E>(
-        mut client: C,
+        client: &mut C,
         future_closure: FC,
-    ) -> Transaction2<FC, F, C, T, E>
+    ) -> Transaction2<FC, F, T, E>
     where
         C: DerefMut2<Target = Client>,
-        F: Future<Item = (C, T), Error = (C, E)>,
-        FC: Fn(C) -> F,
+        F: Future<Item = T, Error = E>,
+        FC: Fn(proto::CountedClient) -> F,
         E: From<Error>,
     {
-        Transaction2(proto::Transaction2Future::new(client, future_closure))
+        Transaction2(proto::Transaction2Future::new(
+            Client(client.deref_mut2().0.clone()),
+            future_closure,
+        ))
     }
 
     pub fn batch_execute(&mut self, query: &str) -> BatchExecute {
@@ -378,22 +382,20 @@ where
 }
 
 #[must_use = "futures do nothing unless polled"]
-pub struct Transaction2<FC, F, C, T, E>(proto::Transaction2Future<FC, F, C, T, E>)
+pub struct Transaction2<FC, F, T, E>(proto::Transaction2Future<FC, F, T, E>)
 where
-    C: DerefMut2<Target = Client>,
-    F: Future<Item = (C, T), Error = (C, E)>,
-    FC: Fn(C) -> F,
+    F: Future<Item = T, Error = E>,
+    FC: Fn(proto::CountedClient) -> F,
     E: From<Error>;
 
-impl<FC, F, C, T, E> Future for Transaction2<FC, F, C, T, E>
+impl<FC, F, T, E> Future for Transaction2<FC, F, T, E>
 where
-    C: DerefMut2<Target = Client>,
-    F: Future<Item = (C, T), Error = (C, E)>,
-    FC: Fn(C) -> F,
+    F: Future<Item = T, Error = E>,
+    FC: Fn(proto::CountedClient) -> F,
     E: From<Error>,
 {
-    type Item = (C, T);
-    type Error = (C, E);
+    type Item = T;
+    type Error = E;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         self.0.poll()
