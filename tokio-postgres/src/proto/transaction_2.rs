@@ -5,7 +5,6 @@ use state_machine_future::RentToOwn;
 use std::ops::{Deref, DerefMut};
 use Client;
 
-use DerefMut2;
 use Error;
 
 pub struct CountedClient {
@@ -81,9 +80,9 @@ where
     fn poll_start<'a>(
         state: &'a mut RentToOwn<'a, Start<FC, F, T, E>>,
     ) -> Poll<AfterStart<FC, F, T, E>, E> {
-        let mut state = state.take();
+        let state = state.take();
         transition!(Beginning {
-            begin: state.client.deref_mut2().0.batch_execute("BEGIN"),
+            begin: state.client.0.batch_execute("BEGIN"),
             client: state.client,
             future_closure: state.future_closure,
         })
@@ -111,7 +110,7 @@ where
             Err(err) => Err(err),
         };
 
-        let mut state = state.take();
+        let state = state.take();
         match result {
             Ok(t) => transition!(Finishing {
                 future: state.client.0.batch_execute("COMMIT"),
@@ -119,7 +118,7 @@ where
                 counter: state.counter
             }),
             Err(err) => transition!(Finishing {
-                future: state.client.deref_mut2().0.batch_execute("ROLLBACK"),
+                future: state.client.0.batch_execute("ROLLBACK"),
                 result: Err(err),
                 counter: state.counter,
             }),

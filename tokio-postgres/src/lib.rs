@@ -120,36 +120,23 @@ impl Client {
         Transaction(proto::TransactionFuture::new(self.0.clone(), future))
     }
 
-    pub fn transaction2<FC, F, C, T, E>(
-        client: &mut C,
+    pub fn transaction2<FC, F, T, E>(
+        client: &mut Client,
         future_closure: FC,
     ) -> Transaction2<FC, F, T, E>
     where
-        C: DerefMut2<Target = Client>,
         F: Future<Item = T, Error = E>,
         FC: Fn(proto::CountedClient) -> F,
         E: From<Error>,
     {
         Transaction2(proto::Transaction2Future::new(
-            Client(client.deref_mut2().0.clone()),
+            Client(client.0.clone()),
             future_closure,
         ))
     }
 
     pub fn batch_execute(&mut self, query: &str) -> BatchExecute {
         BatchExecute(self.0.batch_execute(query))
-    }
-}
-pub trait DerefMut2 {
-    type Target;
-    fn deref_mut2(&mut self) -> &mut Self::Target;
-}
-
-impl DerefMut2 for Client {
-    type Target = Client;
-
-    fn deref_mut2(&mut self) -> &mut Self::Target {
-        self
     }
 }
 
